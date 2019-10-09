@@ -17,19 +17,21 @@ limitations under the License.
 package patchnode
 
 import (
-	"fmt"
-
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/klog"
 	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/apiclient"
 )
 
 // AnnotateCRISocket annotates the node with the given crisocket
 func AnnotateCRISocket(client clientset.Interface, nodeName string, criSocket string) error {
-
-	fmt.Printf("[patchnode] Uploading the CRI Socket information %q to the Node API object %q as an annotation\n", criSocket, nodeName)
-
+	klog.V(1).Infof("[patchnode] Creating the Node API object %q if missing", nodeName)
+	// See the comments for this function
+	if err := apiclient.EnsureNodeObject(client, nodeName); err != nil {
+		return err
+	}
+	klog.V(1).Infof("[patchnode] Uploading the CRI Socket information %q to the Node API object %q as an annotation", criSocket, nodeName)
 	return apiclient.PatchNode(client, nodeName, func(n *v1.Node) {
 		annotateNodeWithCRISocket(n, criSocket)
 	})

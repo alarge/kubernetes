@@ -18,6 +18,7 @@ package cp
 
 import (
 	"archive/tar"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -27,18 +28,16 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/lithammer/dedent"
+	"github.com/spf13/cobra"
+
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
-	"k8s.io/kubernetes/pkg/kubectl/cmd/exec"
-	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
-	"k8s.io/kubernetes/pkg/kubectl/util/i18n"
-	"k8s.io/kubernetes/pkg/kubectl/util/templates"
-
-	"bytes"
-
-	"github.com/renstrom/dedent"
-	"github.com/spf13/cobra"
+	"k8s.io/kubectl/pkg/cmd/exec"
+	cmdutil "k8s.io/kubectl/pkg/cmd/util"
+	"k8s.io/kubectl/pkg/util/i18n"
+	"k8s.io/kubectl/pkg/util/templates"
 )
 
 var (
@@ -46,6 +45,15 @@ var (
 		# !!!Important Note!!!
 		# Requires that the 'tar' binary is present in your container
 		# image.  If 'tar' is not present, 'kubectl cp' will fail.
+		#
+		# For advanced use cases, such as symlinks, wildcard expansion or
+		# file mode preservation consider using 'kubectl exec'.
+
+		# Copy /tmp/foo local file to /tmp/bar in a remote pod in namespace <some-namespace>
+		tar cf - /tmp/foo | kubectl exec -i -n <some-namespace> <some-pod> -- tar xf - -C /tmp/bar
+
+		# Copy /tmp/foo from a remote pod to /tmp/bar locally
+		kubectl exec -n <some-namespace> <some-pod> -- tar cf - /tmp/foo | tar xf - -C /tmp/bar
 
 		# Copy /tmp/foo_dir local directory to /tmp/bar_dir in a remote pod in the default namespace
 		kubectl cp /tmp/foo_dir <some-pod>:/tmp/bar_dir
@@ -66,16 +74,20 @@ var (
 		/file/path for a local file`)
 )
 
+// CopyOptions have the data required to perform the copy operation
 type CopyOptions struct {
-	Container string
-	Namespace string
+	Container  string
+	Namespace  string
+	NoPreserve bool
 
-	ClientConfig *restclient.Config
-	Clientset    kubernetes.Interface
+	ClientConfig      *restclient.Config
+	Clientset         kubernetes.Interface
+	ExecParentCmdName string
 
 	genericclioptions.IOStreams
 }
 
+// NewCopyOptions creates the options for copy
 func NewCopyOptions(ioStreams genericclioptions.IOStreams) *CopyOptions {
 	return &CopyOptions{
 		IOStreams: ioStreams,
@@ -98,6 +110,7 @@ func NewCmdCp(f cmdutil.Factory, ioStreams genericclioptions.IOStreams) *cobra.C
 		},
 	}
 	cmd.Flags().StringVarP(&o.Container, "container", "c", o.Container, "Container name. If omitted, the first container in the pod will be chosen")
+	cmd.Flags().BoolVarP(&o.NoPreserve, "no-preserve", "", false, "The copied file/directory's ownership and permissions will not be preserved in the container")
 
 	return cmd
 }
@@ -109,8 +122,8 @@ type fileSpec struct {
 }
 
 var (
-	errFileSpecDoesntMatchFormat = errors.New("Filespec must match the canonical format: [[namespace/]pod:]file/path")
-	errFileCannotBeEmpty         = errors.New("Filepath can not be empty")
+	errFileSpecDoesntMatchFormat = errors.New("filespec must match the canonical format: [[namespace/]pod:]file/path")
+	errFileCannotBeEmpty         = errors.New("filepath can not be empty")
 )
 
 func extractFileSpec(arg string) (fileSpec, error) {
@@ -138,7 +151,12 @@ func extractFileSpec(arg string) (fileSpec, error) {
 	return fileSpec{}, errFileSpecDoesntMatchFormat
 }
 
+// Complete completes all the required options
 func (o *CopyOptions) Complete(f cmdutil.Factory, cmd *cobra.Command) error {
+	if cmd.Parent() != nil {
+		o.ExecParentCmdName = cmd.Parent().CommandPath()
+	}
+
 	var err error
 	o.Namespace, _, err = f.ToRawKubeConfigLoader().Namespace()
 	if err != nil {
@@ -157,6 +175,7 @@ func (o *CopyOptions) Complete(f cmdutil.Factory, cmd *cobra.Command) error {
 	return nil
 }
 
+// Validate makes sure provided values for CopyOptions are valid
 func (o *CopyOptions) Validate(cmd *cobra.Command, args []string) error {
 	if len(args) != 2 {
 		return cmdutil.UsageErrorf(cmd, cpUsageStr)
@@ -164,6 +183,7 @@ func (o *CopyOptions) Validate(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// Run performs the execution
 func (o *CopyOptions) Run(args []string) error {
 	if len(args) < 2 {
 		return fmt.Errorf("source and destination are required")
@@ -179,7 +199,7 @@ func (o *CopyOptions) Run(args []string) error {
 
 	if len(srcSpec.PodName) != 0 && len(destSpec.PodName) != 0 {
 		if _, err := os.Stat(args[0]); err == nil {
-			return o.copyToPod(fileSpec{File: args[0]}, destSpec)
+			return o.copyToPod(fileSpec{File: args[0]}, destSpec, &exec.ExecOptions{})
 		}
 		return fmt.Errorf("src doesn't exist in local filesystem")
 	}
@@ -188,7 +208,7 @@ func (o *CopyOptions) Run(args []string) error {
 		return o.copyFromPod(srcSpec, destSpec)
 	}
 	if len(destSpec.PodName) != 0 {
-		return o.copyToPod(srcSpec, destSpec)
+		return o.copyToPod(srcSpec, destSpec, &exec.ExecOptions{})
 	}
 	return fmt.Errorf("one of src or dest must be a remote file specification")
 }
@@ -216,7 +236,7 @@ func (o *CopyOptions) checkDestinationIsDir(dest fileSpec) error {
 	return o.execute(options)
 }
 
-func (o *CopyOptions) copyToPod(src, dest fileSpec) error {
+func (o *CopyOptions) copyToPod(src, dest fileSpec, options *exec.ExecOptions) error {
 	if len(src.File) == 0 || len(dest.File) == 0 {
 		return errFileCannotBeEmpty
 	}
@@ -238,30 +258,33 @@ func (o *CopyOptions) copyToPod(src, dest fileSpec) error {
 		err := makeTar(src.File, dest.File, writer)
 		cmdutil.CheckErr(err)
 	}()
+	var cmdArr []string
 
 	// TODO: Improve error messages by first testing if 'tar' is present in the container?
-	cmdArr := []string{"tar", "xf", "-"}
+	if o.NoPreserve {
+		cmdArr = []string{"tar", "--no-same-permissions", "--no-same-owner", "-xmf", "-"}
+	} else {
+		cmdArr = []string{"tar", "-xmf", "-"}
+	}
 	destDir := path.Dir(dest.File)
 	if len(destDir) > 0 {
 		cmdArr = append(cmdArr, "-C", destDir)
 	}
 
-	options := &exec.ExecOptions{
-		StreamOptions: exec.StreamOptions{
-			IOStreams: genericclioptions.IOStreams{
-				In:     reader,
-				Out:    o.Out,
-				ErrOut: o.ErrOut,
-			},
-			Stdin: true,
-
-			Namespace: dest.PodNamespace,
-			PodName:   dest.PodName,
+	options.StreamOptions = exec.StreamOptions{
+		IOStreams: genericclioptions.IOStreams{
+			In:     reader,
+			Out:    o.Out,
+			ErrOut: o.ErrOut,
 		},
+		Stdin: true,
 
-		Command:  cmdArr,
-		Executor: &exec.DefaultRemoteExecutor{},
+		Namespace: dest.PodNamespace,
+		PodName:   dest.PodName,
 	}
+
+	options.Command = cmdArr
+	options.Executor = &exec.DefaultRemoteExecutor{}
 	return o.execute(options)
 }
 
@@ -290,14 +313,15 @@ func (o *CopyOptions) copyFromPod(src, dest fileSpec) error {
 
 	go func() {
 		defer outStream.Close()
-		o.execute(options)
+		err := o.execute(options)
+		cmdutil.CheckErr(err)
 	}()
 	prefix := getPrefix(src.File)
 	prefix = path.Clean(prefix)
 	// remove extraneous path shortcuts - these could occur if a path contained extra "../"
 	// and attempted to navigate beyond "/" in a remote filesystem
 	prefix = stripPathShortcuts(prefix)
-	return untarAll(reader, dest.File, prefix)
+	return o.untarAll(src, reader, dest.File, prefix)
 }
 
 // stripPathShortcuts removes any leading or trailing "../" from a given path
@@ -310,8 +334,8 @@ func stripPathShortcuts(p string) string {
 		trimmed = strings.TrimPrefix(newPath, "../")
 	}
 
-	// trim leftover ".."
-	if newPath == ".." {
+	// trim leftover {".", ".."}
+	if newPath == "." || newPath == ".." {
 		newPath = ""
 	}
 
@@ -333,78 +357,77 @@ func makeTar(srcPath, destPath string, writer io.Writer) error {
 }
 
 func recursiveTar(srcBase, srcFile, destBase, destFile string, tw *tar.Writer) error {
-	filepath := path.Join(srcBase, srcFile)
-	stat, err := os.Lstat(filepath)
+	srcPath := path.Join(srcBase, srcFile)
+	matchedPaths, err := filepath.Glob(srcPath)
 	if err != nil {
 		return err
 	}
-	if stat.IsDir() {
-		files, err := ioutil.ReadDir(filepath)
+	for _, fpath := range matchedPaths {
+		stat, err := os.Lstat(fpath)
 		if err != nil {
 			return err
 		}
-		if len(files) == 0 {
-			//case empty directory
-			hdr, _ := tar.FileInfoHeader(stat, filepath)
+		if stat.IsDir() {
+			files, err := ioutil.ReadDir(fpath)
+			if err != nil {
+				return err
+			}
+			if len(files) == 0 {
+				//case empty directory
+				hdr, _ := tar.FileInfoHeader(stat, fpath)
+				hdr.Name = destFile
+				if err := tw.WriteHeader(hdr); err != nil {
+					return err
+				}
+			}
+			for _, f := range files {
+				if err := recursiveTar(srcBase, path.Join(srcFile, f.Name()), destBase, path.Join(destFile, f.Name()), tw); err != nil {
+					return err
+				}
+			}
+			return nil
+		} else if stat.Mode()&os.ModeSymlink != 0 {
+			//case soft link
+			hdr, _ := tar.FileInfoHeader(stat, fpath)
+			target, err := os.Readlink(fpath)
+			if err != nil {
+				return err
+			}
+
+			hdr.Linkname = target
 			hdr.Name = destFile
 			if err := tw.WriteHeader(hdr); err != nil {
 				return err
 			}
-		}
-		for _, f := range files {
-			if err := recursiveTar(srcBase, path.Join(srcFile, f.Name()), destBase, path.Join(destFile, f.Name()), tw); err != nil {
+		} else {
+			//case regular file or other file type like pipe
+			hdr, err := tar.FileInfoHeader(stat, fpath)
+			if err != nil {
 				return err
 			}
-		}
-		return nil
-	} else if stat.Mode()&os.ModeSymlink != 0 {
-		//case soft link
-		hdr, _ := tar.FileInfoHeader(stat, filepath)
-		target, err := os.Readlink(filepath)
-		if err != nil {
-			return err
-		}
+			hdr.Name = destFile
 
-		hdr.Linkname = target
-		hdr.Name = destFile
-		if err := tw.WriteHeader(hdr); err != nil {
-			return err
-		}
-	} else {
-		//case regular file or other file type like pipe
-		hdr, err := tar.FileInfoHeader(stat, filepath)
-		if err != nil {
-			return err
-		}
-		hdr.Name = destFile
+			if err := tw.WriteHeader(hdr); err != nil {
+				return err
+			}
 
-		if err := tw.WriteHeader(hdr); err != nil {
-			return err
-		}
+			f, err := os.Open(fpath)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
 
-		f, err := os.Open(filepath)
-		if err != nil {
-			return err
+			if _, err := io.Copy(tw, f); err != nil {
+				return err
+			}
+			return f.Close()
 		}
-		defer f.Close()
-
-		if _, err := io.Copy(tw, f); err != nil {
-			return err
-		}
-		return f.Close()
 	}
 	return nil
 }
 
-// clean prevents path traversals by stripping them out.
-// This is adapted from https://golang.org/src/net/http/fs.go#L74
-func clean(fileName string) string {
-	return path.Clean(string(os.PathSeparator) + fileName)
-}
-
-func untarAll(reader io.Reader, destFile, prefix string) error {
-	entrySeq := -1
-
+func (o *CopyOptions) untarAll(src fileSpec, reader io.Reader, destDir, prefix string) error {
+	symlinkWarningPrinted := false
 	// TODO: use compression here?
 	tarReader := tar.NewReader(reader)
 	for {
@@ -415,57 +438,69 @@ func untarAll(reader io.Reader, destFile, prefix string) error {
 			}
 			break
 		}
-		entrySeq++
+
+		// All the files will start with the prefix, which is the directory where
+		// they were located on the pod, we need to strip down that prefix, but
+		// if the prefix is missing it means the tar was tempered with.
+		// For the case where prefix is empty we need to ensure that the path
+		// is not absolute, which also indicates the tar file was tempered with.
+		if !strings.HasPrefix(header.Name, prefix) {
+			return fmt.Errorf("tar contents corrupted")
+		}
+
+		// basic file information
 		mode := header.FileInfo().Mode()
-		outFileName := path.Join(destFile, clean(header.Name[len(prefix):]))
-		baseName := path.Dir(outFileName)
+		destFileName := filepath.Join(destDir, header.Name[len(prefix):])
+
+		if !isDestRelative(destDir, destFileName) {
+			fmt.Fprintf(o.IOStreams.ErrOut, "warning: file %q is outside target destination, skipping\n", destFileName)
+			continue
+		}
+
+		baseName := filepath.Dir(destFileName)
 		if err := os.MkdirAll(baseName, 0755); err != nil {
 			return err
 		}
 		if header.FileInfo().IsDir() {
-			if err := os.MkdirAll(outFileName, 0755); err != nil {
+			if err := os.MkdirAll(destFileName, 0755); err != nil {
 				return err
 			}
 			continue
 		}
 
-		// handle coping remote file into local directory
-		if entrySeq == 0 && !header.FileInfo().IsDir() {
-			exists, err := dirExists(outFileName)
-			if err != nil {
-				return err
-			}
-			if exists {
-				outFileName = filepath.Join(outFileName, path.Base(clean(header.Name)))
-			}
-		}
-
 		if mode&os.ModeSymlink != 0 {
-			err := os.Symlink(header.Linkname, outFileName)
-			if err != nil {
-				return err
+			if !symlinkWarningPrinted && len(o.ExecParentCmdName) > 0 {
+				fmt.Fprintf(o.IOStreams.ErrOut, "warning: skipping symlink: %q -> %q (consider using \"%s exec -n %q %q -- tar cf - %q | tar xf -\")\n", destFileName, header.Linkname, o.ExecParentCmdName, src.PodNamespace, src.PodName, src.File)
+				symlinkWarningPrinted = true
+				continue
 			}
-		} else {
-			outFile, err := os.Create(outFileName)
-			if err != nil {
-				return err
-			}
-			defer outFile.Close()
-			if _, err := io.Copy(outFile, tarReader); err != nil {
-				return err
-			}
-			if err := outFile.Close(); err != nil {
-				return err
-			}
+			fmt.Fprintf(o.IOStreams.ErrOut, "warning: skipping symlink: %q -> %q\n", destFileName, header.Linkname)
+			continue
+		}
+		outFile, err := os.Create(destFileName)
+		if err != nil {
+			return err
+		}
+		defer outFile.Close()
+		if _, err := io.Copy(outFile, tarReader); err != nil {
+			return err
+		}
+		if err := outFile.Close(); err != nil {
+			return err
 		}
 	}
 
-	if entrySeq == -1 {
-		//if no file was copied
-		errInfo := fmt.Sprintf("error: %s no such file or directory", prefix)
-		return errors.New(errInfo)
-	}
 	return nil
+}
+
+// isDestRelative returns true if dest is pointing outside the base directory,
+// false otherwise.
+func isDestRelative(base, dest string) bool {
+	relative, err := filepath.Rel(base, dest)
+	if err != nil {
+		return false
+	}
+	return relative == "." || relative == stripPathShortcuts(relative)
 }
 
 func getPrefix(file string) string {
@@ -483,7 +518,7 @@ func (o *CopyOptions) execute(options *exec.ExecOptions) error {
 	}
 
 	options.Config = o.ClientConfig
-	options.PodClient = o.Clientset.Core()
+	options.PodClient = o.Clientset.CoreV1()
 
 	if err := options.Validate(); err != nil {
 		return err
@@ -493,16 +528,4 @@ func (o *CopyOptions) execute(options *exec.ExecOptions) error {
 		return err
 	}
 	return nil
-}
-
-// dirExists checks if a path exists and is a directory.
-func dirExists(path string) (bool, error) {
-	fi, err := os.Stat(path)
-	if err == nil && fi.IsDir() {
-		return true, nil
-	}
-	if os.IsNotExist(err) {
-		return false, nil
-	}
-	return false, err
 }

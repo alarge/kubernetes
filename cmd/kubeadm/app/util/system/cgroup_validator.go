@@ -18,17 +18,20 @@ package system
 
 import (
 	"bufio"
-	"fmt"
 	"os"
 	"strings"
+
+	"github.com/pkg/errors"
 )
 
 var _ Validator = &CgroupsValidator{}
 
+// CgroupsValidator validates cgroup configuration.
 type CgroupsValidator struct {
 	Reporter Reporter
 }
 
+// Name is part of the system.Validator interface.
 func (c *CgroupsValidator) Name() string {
 	return "cgroups"
 }
@@ -37,12 +40,16 @@ const (
 	cgroupsConfigPrefix = "CGROUPS_"
 )
 
-func (c *CgroupsValidator) Validate(spec SysSpec) (error, error) {
+// Validate is part of the system.Validator interface.
+func (c *CgroupsValidator) Validate(spec SysSpec) ([]error, []error) {
 	subsystems, err := c.getCgroupSubsystems()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get cgroup subsystems: %v", err)
+		return nil, []error{errors.Wrap(err, "failed to get cgroup subsystems")}
 	}
-	return nil, c.validateCgroupSubsystems(spec.Cgroups, subsystems)
+	if err = c.validateCgroupSubsystems(spec.Cgroups, subsystems); err != nil {
+		return nil, []error{err}
+	}
+	return nil, nil
 }
 
 func (c *CgroupsValidator) validateCgroupSubsystems(cgroupSpec, subsystems []string) error {
@@ -64,7 +71,7 @@ func (c *CgroupsValidator) validateCgroupSubsystems(cgroupSpec, subsystems []str
 		}
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("missing cgroups: %s", strings.Join(missing, " "))
+		return errors.Errorf("missing cgroups: %s", strings.Join(missing, " "))
 	}
 	return nil
 

@@ -78,11 +78,6 @@ func trimHeaders(headerNames ...string) ([]string, error) {
 }
 
 func NewSecure(clientCA string, proxyClientNames []string, nameHeaders []string, groupHeaders []string, extraHeaderPrefixes []string) (authenticator.Request, error) {
-	headerAuthenticator, err := New(nameHeaders, groupHeaders, extraHeaderPrefixes)
-	if err != nil {
-		return nil, err
-	}
-
 	if len(clientCA) == 0 {
 		return nil, fmt.Errorf("missing clientCA file")
 	}
@@ -102,10 +97,20 @@ func NewSecure(clientCA string, proxyClientNames []string, nameHeaders []string,
 		opts.Roots.AddCert(cert)
 	}
 
-	return x509request.NewVerifier(opts, headerAuthenticator, sets.NewString(proxyClientNames...)), nil
+	return NewDynamicVerifyOptionsSecure(x509request.StaticVerifierFn(opts), proxyClientNames, nameHeaders, groupHeaders, extraHeaderPrefixes)
 }
 
-func (a *requestHeaderAuthRequestHandler) AuthenticateRequest(req *http.Request) (user.Info, bool, error) {
+// TODO make the string slices dynamic too.
+func NewDynamicVerifyOptionsSecure(verifyOptionFn x509request.VerifyOptionFunc, proxyClientNames []string, nameHeaders []string, groupHeaders []string, extraHeaderPrefixes []string) (authenticator.Request, error) {
+	headerAuthenticator, err := New(nameHeaders, groupHeaders, extraHeaderPrefixes)
+	if err != nil {
+		return nil, err
+	}
+
+	return x509request.NewDynamicCAVerifier(verifyOptionFn, headerAuthenticator, sets.NewString(proxyClientNames...)), nil
+}
+
+func (a *requestHeaderAuthRequestHandler) AuthenticateRequest(req *http.Request) (*authenticator.Response, bool, error) {
 	name := headerValue(req.Header, a.nameHeaders)
 	if len(name) == 0 {
 		return nil, false, nil
@@ -126,10 +131,12 @@ func (a *requestHeaderAuthRequestHandler) AuthenticateRequest(req *http.Request)
 		}
 	}
 
-	return &user.DefaultInfo{
-		Name:   name,
-		Groups: groups,
-		Extra:  extra,
+	return &authenticator.Response{
+		User: &user.DefaultInfo{
+			Name:   name,
+			Groups: groups,
+			Extra:  extra,
+		},
 	}, true, nil
 }
 

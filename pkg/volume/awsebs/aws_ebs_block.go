@@ -1,3 +1,5 @@
+// +build !providerless
+
 /*
 Copyright 2018 The Kubernetes Authors.
 
@@ -22,15 +24,16 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/golang/glog"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/kubernetes/pkg/cloudprovider/providers/aws"
+	"k8s.io/klog"
 	"k8s.io/kubernetes/pkg/util/mount"
-	kstrings "k8s.io/kubernetes/pkg/util/strings"
 	"k8s.io/kubernetes/pkg/volume"
 	"k8s.io/kubernetes/pkg/volume/util"
 	"k8s.io/kubernetes/pkg/volume/util/volumepathhandler"
+	"k8s.io/legacy-cloud-providers/aws"
+	utilstrings "k8s.io/utils/strings"
 )
 
 var _ volume.BlockVolumePlugin = &awsElasticBlockStorePlugin{}
@@ -42,17 +45,17 @@ func (plugin *awsElasticBlockStorePlugin) ConstructBlockVolumeSpec(podUID types.
 	if err != nil {
 		return nil, err
 	}
-	glog.V(5).Infof("globalMapPathUUID: %s", globalMapPathUUID)
+	klog.V(5).Infof("globalMapPathUUID: %s", globalMapPathUUID)
 
 	globalMapPath := filepath.Dir(globalMapPathUUID)
 	if len(globalMapPath) <= 1 {
 		return nil, fmt.Errorf("failed to get volume plugin information from globalMapPathUUID: %v", globalMapPathUUID)
 	}
 
-	return getVolumeSpecFromGlobalMapPath(globalMapPath)
+	return getVolumeSpecFromGlobalMapPath(volumeName, globalMapPath)
 }
 
-func getVolumeSpecFromGlobalMapPath(globalMapPath string) (*volume.Spec, error) {
+func getVolumeSpecFromGlobalMapPath(volumeName string, globalMapPath string) (*volume.Spec, error) {
 	// Get volume spec information from globalMapPath
 	// globalMapPath example:
 	//   plugins/kubernetes.io/{PluginName}/{DefaultKubeletVolumeDevicesDirName}/{volumeID}
@@ -66,6 +69,9 @@ func getVolumeSpecFromGlobalMapPath(globalMapPath string) (*volume.Spec, error) 
 	}
 	block := v1.PersistentVolumeBlock
 	awsVolume := &v1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: volumeName,
+		},
 		Spec: v1.PersistentVolumeSpec{
 			PersistentVolumeSource: v1.PersistentVolumeSource{
 				AWSElasticBlockStore: &v1.AWSElasticBlockStoreVolumeSource{
@@ -171,5 +177,5 @@ func (ebs *awsElasticBlockStore) GetGlobalMapPath(spec *volume.Spec) (string, er
 // path: pods/{podUid}/volumeDevices/kubernetes.io~aws
 func (ebs *awsElasticBlockStore) GetPodDeviceMapPath() (string, string) {
 	name := awsElasticBlockStorePluginName
-	return ebs.plugin.host.GetPodVolumeDeviceDir(ebs.podUID, kstrings.EscapeQualifiedNameForDisk(name)), ebs.volName
+	return ebs.plugin.host.GetPodVolumeDeviceDir(ebs.podUID, utilstrings.EscapeQualifiedName(name)), ebs.volName
 }
